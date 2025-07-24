@@ -173,7 +173,7 @@ class AccuracyScorer(BaseScorer):
         self, prediction: str, context: Optional[dict[str, Any]] = None
     ) -> str:
         """
-        Extract answer from prediction text.
+        Extract answer from prediction text using optimized pattern matching.
 
         Args:
             prediction: Model's prediction
@@ -182,54 +182,46 @@ class AccuracyScorer(BaseScorer):
         Returns:
             Extracted answer
         """
-        # Try multiple patterns in order of preference
-
-        # Pattern 1: "Answer: X" or "answer: X"
-        match = re.search(self.answer_pattern, prediction, re.IGNORECASE)
-        if match:
-            return match.group(1) if match.group(1) else match.group(2)
-
-        # Pattern 2: "The answer is X" or "The correct answer is X"
-        match = re.search(
-            r"(?:the\s+(?:correct\s+)?answer\s+is\s+)([A-D])", prediction, re.IGNORECASE
-        )
-        if match:
-            return match.group(1)
-
-        # Pattern 3: "**X.**" (bold letter with period)
-        match = re.search(r"\*\*([A-D])\.\s*[^*]*\*\*", prediction, re.IGNORECASE)
-        if match:
-            return match.group(1)
-
-        # Pattern 4: Just a single letter at start of response
-        match = re.search(r"^([A-D])\.?\s*$", prediction.strip(), re.IGNORECASE)
-        if match:
-            return match.group(1)
-
-        # Pattern 5: Letter followed by period or colon at start of line
-        match = re.search(r"^([A-D])[\.\:]", prediction, re.MULTILINE | re.IGNORECASE)
-        if match:
-            return match.group(1)
-
+        # Pre-compile regex patterns for better performance
+        patterns = [
+            # Pattern 1: "Answer: X" or "answer: X"
+            (self.answer_pattern, lambda m: m.group(1) if m.group(1) else m.group(2)),
+            # Pattern 2: "The answer is X" or "The correct answer is X"
+            (r"(?:the\s+(?:correct\s+)?answer\s+is\s+)([A-D])", lambda m: m.group(1)),
+            # Pattern 3: "**X.**" (bold letter with period)
+            (r"\*\*([A-D])\.\s*[^*]*\*\*", lambda m: m.group(1)),
+            # Pattern 4: Just a single letter at start of response
+            (r"^([A-D])\.?\s*$", lambda m: m.group(1)),
+            # Pattern 5: Letter followed by period or colon at start of line
+            (r"^([A-D])[\.\:]", lambda m: m.group(1)),
+        ]
+        
+        # Try each pattern in order of preference
+        prediction_text = prediction.strip()
+        for pattern, extractor in patterns:
+            match = re.search(pattern, prediction_text, re.IGNORECASE | re.MULTILINE)
+            if match:
+                return extractor(match)
+        
         # Pattern 6: Stand-alone letter choice (A, B, C, D) near end of text
-        lines = prediction.strip().split("\n")
+        lines = prediction_text.split("\n")
         for line in reversed(lines[-3:]):  # Check last 3 lines
             match = re.search(r"\b([A-D])\b", line, re.IGNORECASE)
             if match:
                 return match.group(1)
 
         # Pattern 7: Letter at the very end of the response
-        match = re.search(r"([A-D])\s*$", prediction.strip(), re.IGNORECASE)
+        match = re.search(r"([A-D])\s*$", prediction_text, re.IGNORECASE)
         if match:
             return match.group(1)
 
         # Fallback: find any choice letter in the text (prefer later occurrences)
-        choice_matches = list(re.finditer(r"\b([A-D])\b", prediction, re.IGNORECASE))
+        choice_matches = list(re.finditer(r"\b([A-D])\b", prediction_text, re.IGNORECASE))
         if choice_matches:
             return choice_matches[-1].group(1)  # Return last occurrence
 
         # Final fallback: return first word
-        words = prediction.strip().split()
+        words = prediction_text.split()
         return words[0] if words else ""
 
     def _convert_letter_to_choice(

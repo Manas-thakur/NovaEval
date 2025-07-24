@@ -4,10 +4,52 @@ Base scorer class for NovaEval.
 This module defines the abstract base class for all scoring mechanisms.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Union
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+def validate_scorer_inputs(
+    prediction: Any, 
+    ground_truth: Any, 
+    context: Optional[Any] = None,
+    allow_empty: bool = True
+) -> tuple[bool, str]:
+    """
+    Centralized input validation for scorers.
+    
+    Args:
+        prediction: Model prediction to validate
+        ground_truth: Ground truth to validate  
+        context: Optional context to validate
+        allow_empty: Whether to allow empty strings
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    # Type validation
+    if not isinstance(prediction, str):
+        return False, f"Prediction must be a string, got {type(prediction).__name__}"
+    
+    if not isinstance(ground_truth, str):
+        return False, f"Ground truth must be a string, got {type(ground_truth).__name__}"
+    
+    if context is not None and not isinstance(context, dict):
+        return False, f"Context must be a dict or None, got {type(context).__name__}"
+    
+    # Content validation
+    if not allow_empty:
+        if not prediction or not prediction.strip():
+            return False, "Prediction cannot be empty or whitespace-only"
+        
+        if not ground_truth or not ground_truth.strip():
+            return False, "Ground truth cannot be empty or whitespace-only"
+    
+    return True, ""
 
 
 class ScoreResult(BaseModel):
@@ -90,16 +132,38 @@ class BaseScorer(ABC):
         if contexts is None:
             contexts = [None] * len(predictions)  # type: ignore
 
+        if len(predictions) != len(ground_truths):
+            raise ValueError(
+                f"Mismatched lengths: predictions ({len(predictions)}) vs ground_truths ({len(ground_truths)})"
+            )
+        
+        if len(contexts) != len(predictions):
+            raise ValueError(
+                f"Mismatched lengths: contexts ({len(contexts)}) vs predictions ({len(predictions)})"
+            )
+
         scores = []
-        for pred, truth, ctx in zip(predictions, ground_truths, contexts):
+        failed_count = 0
+        
+        for i, (pred, truth, ctx) in enumerate(zip(predictions, ground_truths, contexts)):
             try:
                 score = self.score(pred, truth, ctx)
                 scores.append(score)
                 self._track_score(score)
             except Exception as e:
                 # Handle scoring errors gracefully
+                failed_count += 1
                 scores.append(0.0)
-                print(f"Warning: Scoring failed for {self.name}: {e}")
+                logger.warning(
+                    f"Scoring failed for {self.name} at index {i}: {e!r}",
+                    extra={"scorer": self.name, "index": i, "error": str(e)}
+                )
+
+        if failed_count > 0:
+            logger.info(
+                f"Batch scoring completed with {failed_count}/{len(predictions)} failures for {self.name}",
+                extra={"scorer": self.name, "failed_count": failed_count, "total_count": len(predictions)}
+            )
 
         return scores
 
@@ -126,6 +190,18 @@ class BaseScorer(ABC):
         self.total_scores = 0
         self.score_sum = 0.0
         self.scores_history = []
+
+    def clear_history(self, keep_recent: int = 0) -> None:
+        """
+        Clear score history to manage memory usage.
+        
+        Args:
+            keep_recent: Number of recent scores to keep (0 = clear all)
+        """
+        if keep_recent <= 0:
+            self.scores_history = []
+        else:
+            self.scores_history = self.scores_history[-keep_recent:]
 
     def get_stats(self) -> dict[str, Any]:
         """
@@ -175,14 +251,18 @@ class BaseScorer(ABC):
         self.total_scores += 1
         self.scores_history.append(score)
 
-        # Update sum for numeric scores
+        # Extract numeric value for sum calculation
+        numeric_value: float
         if isinstance(score, (int, float)):
-            self.score_sum += float(score)
-        elif isinstance(score, dict) and "score" in score:
-            self.score_sum += float(score["score"])
+            numeric_value = float(score)
         elif isinstance(score, dict):
-            # Use first numeric value
-            self.score_sum += float(next(iter(score.values())))
+            # Try 'score' key first, then fall back to first value
+            numeric_value = float(score.get("score", next(iter(score.values()), 0.0)))
+        else:
+            # Fallback for unexpected types
+            numeric_value = 0.0
+            
+        self.score_sum += numeric_value
 
     def validate_inputs(
         self,
@@ -191,7 +271,7 @@ class BaseScorer(ABC):
         context: Optional[dict[str, Any]] = None,
     ) -> bool:
         """
-        Validate scorer inputs.
+        Validate scorer inputs using centralized validation.
 
         Args:
             prediction: Model prediction
@@ -201,23 +281,44 @@ class BaseScorer(ABC):
         Returns:
             True if inputs are valid, False otherwise
         """
-        if not isinstance(prediction, str) or not isinstance(ground_truth, str):
-            return False
-
-        return not (context is not None and not isinstance(context, dict))
+        is_valid, _ = validate_scorer_inputs(prediction, ground_truth, context)
+        return is_valid
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "BaseScorer":
         """
-        Create a scorer from configuration.
+        Create a scorer from configuration with validation.
 
         Args:
             config: Configuration dictionary
 
         Returns:
             Configured scorer instance
+            
+        Raises:
+            ValueError: If configuration is invalid
         """
+        if not isinstance(config, dict):
+            raise ValueError(f"Config must be a dictionary, got {type(config).__name__}")
+        
+        # Validate required fields if any
+        cls._validate_config(config)
+        
         return cls(**config)
+    
+    @classmethod
+    def _validate_config(cls, config: dict[str, Any]) -> None:
+        """
+        Validate scorer configuration. Override in subclasses for specific validation.
+        
+        Args:
+            config: Configuration to validate
+            
+        Raises:
+            ValueError: If configuration is invalid
+        """
+        # Base validation - can be overridden by subclasses
+        pass
 
     def __str__(self) -> str:
         """String representation of the scorer."""
