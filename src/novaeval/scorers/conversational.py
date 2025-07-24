@@ -16,6 +16,7 @@ import re
 import threading
 from collections.abc import Coroutine
 from typing import Any, Optional, TypeVar
+import logging
 
 from pydantic import BaseModel, Field
 
@@ -23,58 +24,63 @@ from novaeval.models.base import BaseModel as LLMModel
 from novaeval.scorers.base import BaseScorer, ScoreResult
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
-def _run_async_in_sync_context(coro: Coroutine[Any, Any, T]) -> T:
+def run_async_safely(coro: Coroutine[Any, Any, T]) -> T:
     """
-    Helper function to run async code from sync context.
-
-    Handles both cases:
-    - When called from outside an event loop (uses asyncio.run)
-    - When called from within an existing event loop (uses loop.run_until_complete in thread)
+    Safely run async code from sync context with improved error handling.
+    
+    Args:
+        coro: Coroutine to run
+        
+    Returns:
+        Result of the coroutine
+        
+    Raises:
+        RuntimeError: If execution fails
     """
     try:
         # Check if we're already in a running event loop
-        asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
+        # We're in a running loop, need to use a thread
+        return _run_in_thread(coro)
     except RuntimeError:
-        # No running event loop, we can use asyncio.run
-        return asyncio.run(coro)
-
-    # We're in a running loop, we need to run in a separate thread
-    # Use a sentinel object to track completion status
-    _SENTINEL = object()
-    result: Any = _SENTINEL
-    exception: Optional[BaseException] = None
-
-    def run_in_thread() -> None:
-        nonlocal result, exception
+        # No running event loop, safe to use asyncio.run
         try:
-            # Create a new event loop for this thread
+            return asyncio.run(coro)
+        except Exception as e:
+            logger.error(f"Failed to run async operation: {e!r}")
+            raise RuntimeError(f"Async execution failed: {e!s}") from e
+
+
+def _run_in_thread(coro: Coroutine[Any, Any, T]) -> T:
+    """Run coroutine in a separate thread with its own event loop."""
+    result_container = {"result": None, "exception": None}
+    
+    def thread_worker():
+        try:
             new_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(new_loop)
             try:
-                result = new_loop.run_until_complete(coro)
+                result_container["result"] = new_loop.run_until_complete(coro)
             finally:
                 new_loop.close()
-        except (
-            BaseException
-        ) as e:  # Catch ALL exceptions, including SystemExit, KeyboardInterrupt
-            exception = e
-
-    thread = threading.Thread(target=run_in_thread)
+        except Exception as e:
+            result_container["exception"] = e
+    
+    thread = threading.Thread(target=thread_worker, daemon=True)
     thread.start()
-    thread.join()
-
-    if exception:
-        raise exception
-
-    # Ensure thread completed successfully and we have a valid result
-    if result is _SENTINEL:
-        raise RuntimeError(
-            "Thread completed without setting result or raising exception"
-        )
-
-    return result  # type: ignore[return-value]  # We've verified result is not sentinel
+    thread.join(timeout=300)  # 5 minute timeout
+    
+    if thread.is_alive():
+        logger.error("Async operation timed out after 5 minutes")
+        raise RuntimeError("Async operation timed out")
+    
+    if result_container["exception"]:
+        raise result_container["exception"]
+    
+    return result_container["result"]
 
 
 class ConversationTurn(BaseModel):
@@ -242,7 +248,7 @@ class KnowledgeRetentionScorer(BaseScorer):
             return 0.0
 
         try:
-            result = _run_async_in_sync_context(
+            result = run_async_safely(
                 self.evaluate(
                     input_text="",  # Not used in knowledge retention
                     output_text=prediction,
@@ -274,7 +280,7 @@ class KnowledgeRetentionScorer(BaseScorer):
     ) -> float:
         """Synchronous wrapper for knowledge retention evaluation."""
         try:
-            return _run_async_in_sync_context(
+            return run_async_safely(
                 self._evaluate_knowledge_retention_async(
                     prediction, ground_truth, context
                 )
@@ -559,7 +565,7 @@ class ConversationRelevancyScorer(BaseScorer):
             return 0.0
 
         try:
-            result = _run_async_in_sync_context(
+            result = run_async_safely(
                 self.evaluate(
                     input_text="",
                     output_text=prediction,
@@ -591,7 +597,7 @@ class ConversationRelevancyScorer(BaseScorer):
     ) -> float:
         """Synchronous wrapper for relevancy evaluation."""
         try:
-            return _run_async_in_sync_context(
+            return run_async_safely(
                 self._evaluate_relevancy_async(prediction, ground_truth, context)
             )
         except Exception:
@@ -796,7 +802,7 @@ class ConversationCompletenessScorer(BaseScorer):
             return 0.0
 
         try:
-            result = _run_async_in_sync_context(
+            result = run_async_safely(
                 self.evaluate(
                     input_text="",
                     output_text=prediction,
@@ -828,7 +834,7 @@ class ConversationCompletenessScorer(BaseScorer):
     ) -> float:
         """Synchronous wrapper for completeness evaluation."""
         try:
-            return _run_async_in_sync_context(
+            return run_async_safely(
                 self._evaluate_completeness_async(prediction, ground_truth, context)
             )
         except Exception:
@@ -1087,7 +1093,7 @@ class RoleAdherenceScorer(BaseScorer):
             return 0.0
 
         try:
-            result = _run_async_in_sync_context(
+            result = run_async_safely(
                 self.evaluate(
                     input_text="",
                     output_text=prediction,
@@ -1120,7 +1126,7 @@ class RoleAdherenceScorer(BaseScorer):
     ) -> float:
         """Synchronous wrapper for role adherence evaluation."""
         try:
-            return _run_async_in_sync_context(
+            return run_async_safely(
                 self._evaluate_role_adherence_async(prediction, context)
             )
         except Exception:
@@ -1353,7 +1359,7 @@ class ConversationalMetricsScorer(BaseScorer):
             return {"overall": 0.0}
 
         try:
-            result = _run_async_in_sync_context(
+            result = run_async_safely(
                 self.evaluate(
                     input_text="",
                     output_text=prediction,

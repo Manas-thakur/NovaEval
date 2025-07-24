@@ -123,51 +123,87 @@ class GEvalScorer(BaseScorer):
         return "\n".join(prompt_parts)
 
     def _parse_response(self, response: str) -> tuple[float, str]:
-        """Parse the LLM response to extract score and reasoning."""
+        """Parse the LLM response to extract score and reasoning with improved error handling."""
         lines = response.strip().split("\n")
         score = None
         reasoning = ""
 
+        # First pass: look for structured response
         for line in lines:
             line = line.strip()
             if line.startswith("**Final Score:**") or line.startswith("**Score:**"):
                 # Extract score from the line
                 score_text = line.split(":")[-1].strip()
-                try:
-                    # Handle various score formats
-                    if "/" in score_text:
-                        score = float(score_text.split("/")[0])
-                    else:
-                        # Extract first number found
-                        import re
-
-                        numbers = re.findall(r"\d+\.?\d*", score_text)
-                        if numbers:
-                            score = float(numbers[0])
-                except (ValueError, IndexError):
-                    continue
+                score = self._extract_numeric_score(score_text)
+                if score is not None:
+                    break
             elif line.startswith("**Reasoning:**"):
                 reasoning = line.split(":", 1)[-1].strip()
 
-        # If no score found, try to extract from the entire response
+        # Second pass: if no structured score found, try extracting from entire response
         if score is None:
-            import re
-
-            numbers = re.findall(r"\b(\d+\.?\d*)\b", response)
-            if numbers:
-                # Take the last number as it's likely the final score
-                score = float(numbers[-1])
-
+            score = self._extract_numeric_score(response)
+            
         # Normalize score to 0-1 range
         if score is not None:
             min_score, max_score = self.criteria.score_range
-            normalized_score = (score - min_score) / (max_score - min_score)
-            normalized_score = max(0.0, min(1.0, normalized_score))
+            if min_score == max_score:
+                normalized_score = 1.0 if score >= min_score else 0.0
+            else:
+                normalized_score = (score - min_score) / (max_score - min_score)
+                normalized_score = max(0.0, min(1.0, normalized_score))
         else:
             normalized_score = 0.0
-            reasoning = f"Failed to parse score from response: {response[:200]}..."
+            reasoning = f"Failed to parse score from response. Response preview: {response[:200]}..."
 
         return normalized_score, reasoning or response.strip()
+        
+    def _extract_numeric_score(self, text: str) -> Optional[float]:
+        """
+        Extract numeric score from text with robust error handling.
+        
+        Args:
+            text: Text containing potential score
+            
+        Returns:
+            Extracted score or None if no valid score found
+        """
+        import re
+        
+        try:
+            # Handle fraction format (e.g., "4/5")
+            fraction_match = re.search(r"(\d+\.?\d*)\s*/\s*(\d+\.?\d*)", text)
+            if fraction_match:
+                numerator = float(fraction_match.group(1))
+                denominator = float(fraction_match.group(2))
+                if denominator != 0:
+                    # Convert fraction to the expected range
+                    min_score, max_score = self.criteria.score_range
+                    return min_score + (numerator / denominator) * (max_score - min_score)
+            
+            # Look for numbers within our expected range
+            min_score, max_score = self.criteria.score_range
+            numbers = re.findall(r"\b(\d+\.?\d*)\b", text)
+            for num_str in reversed(numbers):  # Prefer later numbers as final scores
+                try:
+                    num = float(num_str)
+                    if min_score <= num <= max_score:
+                        return num
+                except ValueError:
+                    continue
+                    
+            # If no numbers in range, take the last number found
+            if numbers:
+                try:
+                    return float(numbers[-1])
+                except ValueError:
+                    pass
+                    
+        except Exception:
+            # Silently handle any parsing errors
+            pass
+            
+        return None
 
     async def _evaluate_single(
         self, input_text: str, output_text: str, context: Optional[str] = None
