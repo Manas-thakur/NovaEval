@@ -11,6 +11,7 @@ This module implements various metrics for evaluating RAG systems including:
 """
 
 import asyncio
+import logging
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -18,6 +19,8 @@ from sentence_transformers import SentenceTransformer
 
 from novaeval.models.base import BaseModel as LLMModel
 from novaeval.scorers.base import BaseScorer, ScoreResult
+
+logger = logging.getLogger(__name__)
 
 
 class AnswerRelevancyScorer(BaseScorer):

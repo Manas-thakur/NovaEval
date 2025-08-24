@@ -323,7 +323,7 @@ class PanelOfJudgesScorer(BaseScorer):
     async def _evaluate_with_judge(
         self, judge: JudgeConfig, prompt: str
     ) -> dict[str, Any]:
-        """Evaluate with a single judge."""
+        """Evaluate with a single judge with improved error handling."""
 
         try:
             # Set judge-specific temperature if different from default
@@ -338,24 +338,16 @@ class PanelOfJudgesScorer(BaseScorer):
             if original_temp is not None and hasattr(judge.model, "temperature"):
                 judge.model.temperature = original_temp
 
-            # Parse JSON response
-            import json
-            import re
-
-            # Extract JSON from response
-            json_match = re.search(r"\{.*\}", response, re.DOTALL)
-            if not json_match:
-                raise ValueError("No JSON found in judge response")
-
-            result = json.loads(json_match.group())
+            # Parse JSON response with robust error handling
+            result = self._parse_judge_response(response)
 
             # Validate required fields
             if "score" not in result or "reasoning" not in result:
-                raise ValueError("Judge response missing required fields")
+                raise ValueError("Judge response missing required fields (score, reasoning)")
 
             # Normalize score to 0-1 range
             score = float(result["score"])
-            if score < 1 or score > 5:
+            if not (1 <= score <= 5):
                 raise ValueError(f"Score must be between 1 and 5, got {score}")
 
             normalized_score = (score - 1) / 4  # Convert 1-5 to 0-1
@@ -371,6 +363,105 @@ class PanelOfJudgesScorer(BaseScorer):
 
         except Exception as e:
             raise Exception(f"Judge evaluation failed: {e!s}")
+
+    def _parse_judge_response(self, response: str) -> dict[str, Any]:
+        """
+        Parse judge response with improved JSON extraction and error handling.
+        
+        Args:
+            response: Raw response from judge
+            
+        Returns:
+            Parsed response dictionary
+            
+        Raises:
+            ValueError: If response cannot be parsed
+        """
+        import json
+        import re
+        
+        # Try multiple JSON extraction strategies
+        strategies = [
+            # Strategy 1: Extract JSON block between { and }
+            lambda r: re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', r, re.DOTALL),
+            # Strategy 2: Look for JSON-like structure with quotes
+            lambda r: re.search(r'\{[^{}]*"[^"]*"[^{}]*\}', r, re.DOTALL),
+            # Strategy 3: Extract everything between first { and last }
+            lambda r: self._extract_outer_json(r),
+        ]
+        
+        for i, strategy in enumerate(strategies):
+            try:
+                json_match = strategy(response)
+                if json_match:
+                    json_str = json_match.group() if hasattr(json_match, 'group') else json_match
+                    result = json.loads(json_str)
+                    if isinstance(result, dict):
+                        return result
+            except (json.JSONDecodeError, AttributeError):
+                continue
+                
+        # Fallback: try to extract fields manually using regex
+        try:
+            return self._extract_fields_manually(response)
+        except Exception:
+            raise ValueError(f"No valid JSON found in judge response. Response: {response[:200]}...")
+            
+    def _extract_outer_json(self, text: str) -> Optional[str]:
+        """Extract JSON from first { to last } with bracket counting."""
+        first_brace = text.find('{')
+        if first_brace == -1:
+            return None
+            
+        bracket_count = 0
+        for i, char in enumerate(text[first_brace:], first_brace):
+            if char == '{':
+                bracket_count += 1
+            elif char == '}':
+                bracket_count -= 1
+                if bracket_count == 0:
+                    return text[first_brace:i+1]
+        return None
+        
+    def _extract_fields_manually(self, response: str) -> dict[str, Any]:
+        """Extract required fields manually when JSON parsing fails."""
+        import re
+        
+        result = {}
+        
+        # Extract score
+        score_patterns = [
+            r'"score":\s*(\d+)',
+            r'score["\']?\s*:\s*(\d+)',
+            r'Score["\']?\s*:\s*(\d+)',
+        ]
+        
+        for pattern in score_patterns:
+            match = re.search(pattern, response, re.IGNORECASE)
+            if match:
+                try:
+                    result["score"] = int(match.group(1))
+                    break
+                except ValueError:
+                    continue
+                    
+        # Extract reasoning
+        reasoning_patterns = [
+            r'"reasoning":\s*"([^"]*)"',
+            r'reasoning["\']?\s*:\s*["\']([^"\']*)["\']',
+            r'Reasoning["\']?\s*:\s*["\']?([^"\'\\n]*)',
+        ]
+        
+        for pattern in reasoning_patterns:
+            match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
+            if match:
+                result["reasoning"] = match.group(1).strip()
+                break
+                
+        if "score" not in result or "reasoning" not in result:
+            raise ValueError("Could not extract required fields manually")
+            
+        return result
 
     def _calculate_consensus(self, scores: list[float]) -> float:
         """Calculate consensus level among judges (0-1)."""
